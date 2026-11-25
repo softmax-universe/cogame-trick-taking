@@ -845,29 +845,52 @@ proc userPrompt*(sim: Sim, prompt: string): string =
 # ---- Reply parsing ----------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Parses a single JSON object directly or inside one top-level code fence.
-  ## Never scrapes braces from prose or accepts multiple fenced blocks.
+  ## Parses a single JSON object directly or from a unique fenced JSON action block.
+  ## Allows surrounding commentary and non-action code blocks, but never scrapes
+  ## braces from prose or accepts multiple JSON action blocks.
   let trimmed = text.strip()
   if trimmed.len == 0:
     raise newException(TricksError, "empty response")
-  var candidate = trimmed
-  if trimmed.startsWith("```"):
-    let firstNl = trimmed.find('\n')
-    if firstNl < 0:
-      raise newException(TricksError, "malformed code fence in response")
-    let tag = trimmed[3 ..< firstNl].strip().toLowerAscii()
-    if tag.len > 0 and tag != "json":
-      raise newException(TricksError, "unexpected code fence language: " & tag)
-    if not trimmed.endsWith("```") or trimmed.len <= firstNl + 4:
-      raise newException(TricksError, "unclosed code fence or trailing text after fence")
-    candidate = trimmed[firstNl + 1 ..< trimmed.len - 3].strip()
-    if "```" in candidate:
-      raise newException(TricksError, "ambiguous response: multiple code fences")
-  elif "```" in trimmed:
-    raise newException(TricksError, "ambiguous response: unexpected text outside code fence")
+  if "```" in trimmed:
+    var candidates: seq[JsonNode]
+    var pos = 0
+    while true:
+      let openIdx = trimmed.find("```", pos)
+      if openIdx < 0:
+        break
+      let firstNl = trimmed.find('\n', openIdx)
+      if firstNl < 0:
+        raise newException(TricksError, "malformed code fence in response")
+      let tag = trimmed[openIdx + 3 ..< firstNl].strip().toLowerAscii()
+      let closeIdx = trimmed.find("```", firstNl + 1)
+      if closeIdx < 0:
+        raise newException(TricksError, "unclosed code fence in response")
+      let blockText = trimmed[firstNl + 1 ..< closeIdx].strip()
+      pos = closeIdx + 3
+      if tag == "json":
+        var parsed: JsonNode
+        try:
+          parsed = parseJson(blockText)
+        except CatchableError as error:
+          raise newException(TricksError, "invalid JSON in response: " & error.msg)
+        if parsed.kind != JObject:
+          raise newException(TricksError, "response must be a JSON object")
+        candidates.add(parsed)
+      elif tag.len == 0:
+        try:
+          let parsed = parseJson(blockText)
+          if parsed.kind == JObject:
+            candidates.add(parsed)
+        except CatchableError:
+          discard
+    if candidates.len == 0:
+      raise newException(TricksError, "no JSON object found in code fence")
+    if candidates.len > 1:
+      raise newException(TricksError, "ambiguous response: multiple JSON code fences")
+    return candidates[0]
   var parsed: JsonNode
   try:
-    parsed = parseJson(candidate)
+    parsed = parseJson(trimmed)
   except CatchableError as error:
     raise newException(TricksError, "invalid JSON in response: " & error.msg)
   if parsed.kind != JObject:
