@@ -122,9 +122,9 @@
           "type": "boolean"
         },
         "model": {
-          "description": "Claude model that drives every seat.",
+          "description": "Model ID for LLM-driven seats (overridden by per-seat COWORLD_LLM_MODEL when set).",
           "type": "string",
-          "default": "claude-sonnet-5"
+          "default": "anthropic/claude-haiku-4.5"
         },
         "maxOutputTokens": {
           "type": "integer",
@@ -446,7 +446,7 @@
     "protocols": {
       "player": {
         "type": "text",
-        "value": "tricks.player.v2. JSON text frames over the seat WebSocket. The game sends welcome, redacted seat-private state, and final frames. A prompt or scripted player sends {\"type\":\"prompt\",\"prompt\":str,\"scripted\":bool,\"baseline\":str}. An external policy sends {\"type\":\"register\",\"control\":\"external\"}, receives {\"type\":\"observation\",\"id\":int,\"observation\":{seat-private state,legalActions:[{id,description}]}}, and returns {\"type\":\"action\",\"id\":int,\"action\":{\"choices\":[1-based legal action ids],\"notes\":str}}. One choice is required except Hearts passing, which needs three distinct card ids. The game validates the selection and applies its normal rules, scores, and replay. Missing or invalid selections use the named scripted baseline."
+        "value": "tricks.player.v2. JSON text frames over the seat WebSocket. The game sends welcome, redacted seat-private state, and final frames. A prompt or scripted player sends {\"type\":\"prompt\",\"prompt\":str,\"scripted\":bool,\"baseline\":str,\"model\":str}. An external policy sends {\"type\":\"register\",\"control\":\"external\"}, receives {\"type\":\"observation\",\"id\":int,\"observation\":{seat-private state,legalActions:[{id,description}]}}, and returns {\"type\":\"action\",\"id\":int,\"action\":{\"choices\":[1-based legal action ids],\"notes\":str}}. One choice is required except Hearts passing, which needs three distinct card ids. The game validates the selection and applies its normal rules, scores, and replay. Missing, invalid, or ambiguous selections fail the seat and terminate the episode with a typed player_failure.json and no default scores."
       },
       "global": {
         "type": "text",
@@ -491,11 +491,14 @@
       "id": "trick-taking-player",
       "name": "Trick-Taking Prompt Player",
       "type": "player",
-      "description": "The reference trick-taking policy: delivers its PLAYER_PROMPT (or a default trick-taking personality) to the game and spectates until the final frame. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
+      "description": "The reference trick-taking LLM policy: delivers its PLAYER_PROMPT (or a default trick-taking personality) and optional COWORLD_LLM_MODEL to the game and spectates until the final frame. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
       "image": "{{TRICK_TAKING_IMAGE}}",
       "run": [
         "/bin/trick-taking-player"
       ],
+      "env": {
+        "COWORLD_LLM_ENABLED": "true"
+      },
       "resources": {
         "requests": {
           "cpu": "100m",

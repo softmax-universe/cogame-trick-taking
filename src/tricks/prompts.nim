@@ -82,8 +82,8 @@ proc tableProtocol*(selection: PromptSelection): string =
 - Your notes are private to you and are handed back to you before every
   decision. Keep your card count, the voids you have spotted, and your read
   on each cog in them.
-- Pick exactly one option from the legal list you are given. An illegal
-  answer is replaced by a house baseline move, which is never what you want.
+- Pick exactly one option from the legal list you are given. An illegal or
+  invalid answer fails your seat and ends the episode.
 
 """
   of pvPlain:
@@ -97,16 +97,16 @@ in mind.
 
 Your notes are private and return before each decision. Use them to track
 cards, observed voids and your assessment of each cog. Choose exactly one
-of the listed legal options. An illegal reply gives control of that move
-to the house baseline, so avoid it.
+of the listed legal options. An illegal or invalid reply fails your seat
+and ends the episode.
 
 """
   of pvNumbered:
     """
 
 Decision checklist:
-1. Select exactly one option from the supplied legal list. If your reply
-   is illegal, a house baseline move replaces it; avoid that substitution.
+1. Select exactly one option from the supplied legal list. An illegal or
+   invalid reply fails your seat and ends the episode.
 2. Reason about other hands only from bids and played cards. Their cards
    are never visible to you.
 3. Do not chat, signal or make side deals. At partnership tables, only
@@ -128,8 +128,7 @@ What carries your reasoning forward? Your own private notes, returned
 before each decision. Preserve card counts, spotted voids and reads on
 the other cogs there.
 Which reply is valid? Exactly one option from the provided legal list.
-An illegal answer is replaced by a house baseline move; avoid giving up
-your choice that way.
+An illegal or invalid answer fails your seat and ends the episode.
 
 """
   of pvReordered:
@@ -137,8 +136,8 @@ your choice that way.
 
 Keep card counts, observed voids and your reading of each cog in your notes.
 Only you receive those notes, and they return before every decision.
-At each decision, choose exactly one listed legal option: an illegal answer
-causes an unwanted substitution by the house baseline.
+At each decision, choose exactly one listed legal option: an illegal or
+invalid answer fails your seat and ends the episode.
 
 No cog reveals its cards to you. Your knowledge of other hands comes from
 interpreting bids and card plays. There is no chat, signalling or side
@@ -159,8 +158,8 @@ that when deciding what to bid or lead.
 Carry your analysis in the notes returned to you at every decision; nobody
 else receives them. Useful contents include the card count, known voids
 and your assessment of each participant. Submit one choice from the legal
-options supplied. Outside that list, the house baseline chooses your move
-instead, an outcome you should avoid.
+options supplied. An illegal or invalid answer fails your seat and ends
+the episode.
 
 """
   of pvHeldoutReference:
@@ -174,7 +173,7 @@ will read those choices; factor that into bidding and leading.
 Memory: notes belong to you alone and are supplied again before each
 decision. Store card counts, identified voids and your reads on each cog.
 Action boundary: choose one and only one supplied legal option. An illegal
-answer triggers a house-baseline replacement move, which you should avoid.
+or invalid answer fails your seat and ends the episode.
 
 """
   of pvMixed:

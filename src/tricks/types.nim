@@ -5,7 +5,7 @@
 ## Nothing here knows about a specific rule module. The module records live
 ## in `rules.nim`; the engine that drives them lives in `sim.nim`.
 
-import std/[json, unicode]
+import std/[json, strutils, unicode]
 
 const
   Seats* = 4
@@ -52,6 +52,7 @@ type
     turnDelayMs*: int         ## slept after each COMPLETED trick
     playerConnectTimeoutSeconds*: float
     model*: string
+    modelExplicit*: bool
     maxOutputTokens*: int
     llmTimeoutSeconds*: int
 
@@ -225,7 +226,8 @@ proc defaultGameConfig*(): GameConfig =
     episodeTimeoutSeconds: 1200,
     turnDelayMs: 250,
     playerConnectTimeoutSeconds: 180,
-    model: "claude-sonnet-5",
+    model: "anthropic/claude-haiku-4.5",
+    modelExplicit: false,
     maxOutputTokens: 900,
     llmTimeoutSeconds: 20
   )
@@ -265,7 +267,10 @@ proc update*(config: var GameConfig, configJson: string) =
     config.playerConnectTimeoutSeconds =
       node["player_connect_timeout_seconds"].getFloat()
   if node.hasKey("model"):
-    config.model = node["model"].getStr()
+    let configuredModel = node["model"].getStr().strip()
+    if configuredModel.len > 0:
+      config.model = configuredModel
+      config.modelExplicit = true
   if node.hasKey("maxOutputTokens"):
     config.maxOutputTokens = node["maxOutputTokens"].getInt()
   if node.hasKey("llmTimeoutSeconds"):

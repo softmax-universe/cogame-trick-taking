@@ -122,8 +122,8 @@ suite "bounded, legal orders":
         sim.applyMove(scriptedMove(sim, "follow"), "", true)
       check phases.len > 0
 
-suite "degrade, never hang":
-  test "decide with no credentials returns the scripted move immediately":
+suite "fail honestly without substitute actions":
+  test "decide with no credentials fails inconclusive instead of substituting scripted play":
     var config = fixture("euchre", 21)
     let client = newLlmClient(config)
     client.disabled = true
@@ -133,32 +133,81 @@ suite "degrade, never hang":
     let decision = client.decide(sim, "some operator prompt",
       scripted = false, baseline = "follow", selection = PromptSelection())
     check epochTime() - started < 2.0
-    check decision.scripted
-    check moveIsLegal(sim, decision.move)
-    check decision.notes.len == 0
+    check decision.failed
+    check decision.failureKind == "episode_inconclusive"
+    check not decision.scripted
 
   test "the 429 backoff and one call's worst case are both bounded":
-    ## Every wait on the model path has to be a number the deadline can
-    ## accommodate. The spacing floor a 429 raises is capped, and the call
-    ## itself is at most one attempt plus one retry, so the last decision an
-    ## episode starts cannot run past the hard guard.
     var config = fixture("euchre", 61)
     let client = newLlmClient(config)
     for _ in 0 ..< 500:
       client.noteThrottled()
     check client.extraSpacingMs == MaxExtraSpacingMs
     check client.worstCaseCallSeconds() ==
-      (2 * config.llmTimeoutSeconds).float
-    ## The whole of one decision: the spacing floor at its ceiling plus the
-    ## call itself. runGame refuses to START a decision unless this much
-    ## time remains before the hard guard, so the bound is what keeps the
-    ## settle inside the episode budget.
+      config.llmTimeoutSeconds.float
     let worstDecision =
       (DecisionSpacingMs + client.extraSpacingMs).float / 1000.0 +
       client.worstCaseCallSeconds()
     check worstDecision < 60.0
 
-  test "an unparseable reply is rejected and the baseline move is legal":
+  test "extractJsonObject accepts direct JSON and single fence, rejects brace scraping and ambiguity":
+    let direct = extractJsonObject("{\"card\": \"10H\"}")
+    check direct["card"].getStr() == "10H"
+    let fenced = extractJsonObject("```json\n{\"card\": \"10H\"}\n```")
+    check fenced["card"].getStr() == "10H"
+    let plainFence = extractJsonObject("```\n{\"bid\": 3}\n```")
+    check plainFence["bid"].getInt() == 3
+    for bad in [
+      "",
+      "not json at all",
+      "I think I will play {\"card\": \"10H\"} now.",
+      "{\"card\": \"10H\"} trailing text",
+      "```json\n{\"card\": \"10H\"}\n```\n```json\n{\"card\": \"9C\"}\n```",
+      "Here:\n```json\n{\"card\": \"10H\"}\n```",
+      "[1, 2, 3]"
+    ]:
+      var raised = false
+      try:
+        discard extractJsonObject(bad)
+      except TricksError:
+        raised = true
+      check raised
+
+  test "parseDecision rejects shims, conflicting keys, and invalid types":
+    var config = fixture("euchre", 31)
+    var sim = initSim(config)
+    sim.beginHand()
+    ## Euchre bid round 1: no bid->pass shim, no ambiguous suit with pass, no conflicting card key.
+    for bad in [
+      "{\"bid\": 1}",
+      "{\"action\": \"pass\", \"suit\": \"hearts\"}",
+      "{\"action\": \"order\", \"card\": \"9C\"}",
+      "{\"action\": \"order it up\"}",
+      "{\"action\": \"shout\"}"
+    ]:
+      var raised = false
+      try:
+        discard parseDecision(sim, parseJson(bad))
+      except TricksError:
+        raised = true
+      check raised
+    ## Valid concise action without required notes field.
+    let validBid = parseDecision(sim, parseJson("{\"action\": \"pass\"}"))
+    check validBid.move.action == "pass"
+    check validBid.notes == ""
+    ## Advance to play phase and verify integer card index shim is rejected.
+    while sim.phase != phPlay and not sim.done:
+      sim.applyMove(scriptedMove(sim, "follow"), "", true)
+    for badPlay in ["{\"card\": 1}", "{\"card\": \"1\"}", "{\"card\": \"ZZ\"}",
+        "{\"card\": \"" & cardCode(legalCards(sim)[0]) & "\", \"bid\": 1}"]:
+      var raised = false
+      try:
+        discard parseDecision(sim, parseJson(badPlay))
+      except TricksError:
+        raised = true
+      check raised
+
+  test "an unparseable reply is rejected and explicit scripted baseline move is legal":
     for module in Modules:
       var config = fixture(module, 31)
       var sim = initSim(config)
@@ -167,18 +216,15 @@ suite "degrade, never hang":
           "{\"bid\": 99}", "{\"action\": \"shout\"}"]:
         var failed = false
         try:
-          let payload =
-            (if '{' in text: extractJsonObject(text) else: parseJson("{}"))
+          let payload = extractJsonObject(text)
           discard parseDecision(sim, payload)
         except CatchableError:
           failed = true
-        if not failed:
-          ## A reply that parses must still be legal; the applier decides.
-          discard
-      let fallback = baselineDecision(sim, "follow", "two bad replies")
+        check failed
+      let fallback = baselineDecision(sim, "follow", "bad reply")
       check fallback.scripted
       check moveIsLegal(sim, fallback.move)
-      check fallback.error == "two bad replies"
+      check fallback.error == "bad reply"
 
   test "an episode whose every model call fails still reaches complete":
     for module in Modules:
@@ -253,8 +299,6 @@ suite "the tell is spectator-side only":
           ## Every seat's whole view, exactly as the model would see it.
           prompts.add(systemPrompt(sim, sim.actorSlot, PromptSelection()))
           prompts.add(userPrompt(sim, "operator guidance goes here"))
-          prompts.add(userPrompt(sim, "operator guidance goes here",
-            retry = true))
           sim.applyMove(scriptedMove(sim, "follow"), "", true)
       for event in sim.events:
         if event.kind == evBid or

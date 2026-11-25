@@ -25,7 +25,10 @@ parser.add_argument("revision")
 parser.add_argument("--variant", choices=("euchre", "spades", "hearts", "oh-hell"), default="oh-hell")
 parser.add_argument("--wording", default="canonical")
 parser.add_argument("--prompt-seed", type=int, default=0)
-parser.add_argument("--mode", choices=("accepted", "retry", "fallback", "greedy", "refusal", "sampled"))
+parser.add_argument(
+    "--mode",
+    choices=("accepted", "invalid_output", "ambiguous", "greedy", "refusal", "invalid_model", "missing_backend", "sampled"),
+)
 args = parser.parse_args()
 binary, output, revision = args.binary, args.output, args.revision
 manifest = json.loads((Path(__file__).resolve().parents[1] / "coworld_manifest_template.json").read_text())
@@ -33,7 +36,12 @@ variant_config = next(v["game_config"] for v in manifest["variants"] if v["id"] 
 root = Path(output)
 root.mkdir(mode=0o700, parents=True, exist_ok=False)
 reports = []
-for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "greedy", "refusal", "sampled"]:
+all_modes = (
+    [args.mode]
+    if args.mode
+    else ["accepted", "invalid_output", "ambiguous", "greedy", "refusal", "invalid_model", "missing_backend", "sampled"]
+)
+for mode in all_modes:
     folder = root / mode
     folder.mkdir(mode=0o700)
     requests = []
@@ -46,17 +54,38 @@ for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "gre
             assert self.path == "/v1/messages"
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             user = body["messages"][0]["content"]
+            call_id = str(uuid.uuid4())
+            if mode == "invalid_model":
+                err = json.dumps({"error": {"type": "invalid_request_error", "message": "model not found"}}).encode()
+                requests.append(
+                    {
+                        "platform_call_id": call_id,
+                        "caller_request": body,
+                        "caller_slot": self.headers["X-Coworld-Player-Slot"],
+                        "provider_response": {"status": 400, "body": err.decode()},
+                    }
+                )
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("X-Softmax-Llm-Call-Id", call_id)
+                self.send_header("Content-Length", str(len(err)))
+                self.end_headers()
+                self.wfile.write(err)
+                return
+
             action = {"notes": "PRIVATE NOTE SENTINEL"}
             if "YOUR LEGAL CARDS" in user:
-                action["card"] = 1
+                legal_line = user.split("YOUR LEGAL CARDS (pick one): ", 1)[1].split("\n", 1)[0]
+                action["card"] = legal_line.split(",")[0].strip()
             elif "Legal bids: " in user:
                 action["bid"] = int(re.search(r"Legal bids: (\d+)", user).group(1))
-            elif "Choose EXACTLY 3 distinct cards" in user:
+            elif "Choose 3 distinct cards" in user:
                 action["cards"] = user.split("YOUR HAND: ", 1)[1].split("\n", 1)[0].split()[:3]
-            elif "must now discard ONE card" in user:
+            elif "must discard one card" in user:
                 action["card"] = user.split("Your hand: ", 1)[1].split("\n", 1)[0].split()[0]
-            elif "Legal suits: " in user:
-                action.update(action="name", suit=user.split("Legal suits: ", 1)[1].split(",", 1)[0].split(".", 1)[0])
+            elif "with a legal suit (" in user:
+                suit = user.split("with a legal suit (", 1)[1].split(")", 1)[0].split(",")[0].strip()
+                action.update(action="name", suit=suit)
             elif '"order" (make ' in user:
                 action["action"] = "order"
             elif "Bid a whole number of tricks" in user:
@@ -64,9 +93,10 @@ for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "gre
             else:
                 raise AssertionError(user)
             raw = json.dumps(action, separators=(",", ":"))
-            if mode == "fallback" or mode == "retry" and "previous reply was invalid" not in user:
+            if mode == "invalid_output":
                 raw = "PRIVATE INVALID RESPONSE SENTINEL"
-            call_id = str(uuid.uuid4())
+            elif mode == "ambiguous":
+                raw = "```json\n" + raw + "\n```\n```json\n" + raw + "\n```"
             response = {
                 "id": call_id,
                 "type": "message",
@@ -125,9 +155,14 @@ for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "gre
         "promptVariant": args.wording,
         "promptSeed": args.prompt_seed,
     }
+    config.pop("model", None)
+    if mode == "invalid_model":
+        config["model"] = "invalid/nonexistent-model"
     config_path = folder / "config.json"
     config_path.write_text(json.dumps(config))
     environment = dict(os.environ)
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI", "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEARER_TOKEN_BEDROCK", "COWORLD_LLM_ENDPOINT", "COWORLD_LLM_MODEL"):
+        environment.pop(key, None)
     environment.update(
         COGAME_HOST="127.0.0.1",
         COGAME_PORT=str(port),
@@ -135,13 +170,16 @@ for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "gre
         COGAME_RESULTS_URI=(folder / "results.json").as_uri(),
         COGAME_SAVE_REPLAY_URI=(folder / "replay.json").as_uri(),
         COGAME_SAVE_TRAJECTORY_URI=(folder / "trajectory.jsonl").as_uri(),
-        COWORLD_LLM_ENDPOINT=f"http://127.0.0.1:{server.server_port}",
-        COWORLD_LLM_MODEL="fixture/native",
+        COGAME_PLAYER_FAILURE_URI=(folder / "player_failure.json").as_uri(),
         COWORLD_LLM_TEMPERATURE="1" if mode == "sampled" else "0",
         COWORLD_EPISODE_ID="fixture-" + mode,
         COWORLD_GAME_VERSION="source-fixture",
         COWORLD_SOURCE_REVISION=revision,
     )
+    if mode != "missing_backend":
+        environment["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{server.server_port}"
+        environment["COWORLD_LLM_MODEL"] = "fixture/native"
+    failure_modes = {"invalid_output", "ambiguous", "refusal", "invalid_model", "missing_backend"}
     with (folder / "game.log").open("w") as log:
         process = subprocess.Popen([binary], env=environment, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -166,9 +204,11 @@ for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "gre
             try:
                 for seat in sockets:
                     seat.send(json.dumps({"type": "prompt", "prompt": "PRIVATE OPERATOR SENTINEL"}))
-                assert process.wait(timeout=config["episodeTimeoutSeconds"] + 60) == 0, (
-                    folder / "game.log"
-                ).read_text()
+                exit_code = process.wait(timeout=config["episodeTimeoutSeconds"] + 60)
+                if mode in failure_modes:
+                    assert exit_code != 0, f"expected non-zero exit in {mode}, got 0"
+                else:
+                    assert exit_code == 0, (folder / "game.log").read_text()
             finally:
                 for seat in sockets:
                     seat.close()
@@ -178,6 +218,37 @@ for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "gre
                 process.wait(timeout=5)
             server.shutdown()
             server.server_close()
+
+    if mode in failure_modes:
+        assert not (folder / "results.json").exists(), f"{mode} must not write default results.json"
+        failure_doc = json.loads((folder / "player_failure.json").read_text())
+        assert set(failure_doc.keys()) == {"message", "failed_policy_index", "kind"}
+        expected_kind = "player_error" if mode in {"invalid_output", "ambiguous"} else "episode_inconclusive"
+        assert failure_doc["kind"] == expected_kind, failure_doc
+        assert isinstance(failure_doc["failed_policy_index"], int) and 0 <= failure_doc["failed_policy_index"] < 4
+        assert len(failure_doc["message"]) >= 1
+        replay_doc = json.loads((folder / "replay.json").read_text())
+        assert replay_doc["failure"]["kind"] == expected_kind
+        events = [json.loads(line) for line in (folder / "trajectory.jsonl").read_text().splitlines()]
+        assert events[-1]["status"] == "failed"
+        if mode == "invalid_model":
+            assert requests and requests[0]["caller_request"]["model"] == "invalid/nonexistent-model"
+        if mode == "invalid_output":
+            assert "PRIVATE INVALID RESPONSE SENTINEL" in replay_doc["failure"]["rawOutput"]
+        if mode == "ambiguous":
+            assert "```json" in replay_doc["failure"]["rawOutput"]
+        reports.append(
+            {
+                "mode": mode,
+                "failed_honestly": True,
+                "failure_kind": failure_doc["kind"],
+                "native_call_joins": len(requests),
+                "source_revision": revision,
+            }
+        )
+        continue
+
+    assert not (folder / "player_failure.json").exists()
     events = [json.loads(line) for line in (folder / "trajectory.jsonl").read_text().splitlines()]
     decisions = events[:-1]
     assert decisions and events[-1]["status"] == "completed"
@@ -193,8 +264,7 @@ for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "gre
                 continue
             system, user = [message["content"] for message in attempt["prompt"]]
             assert metadata["system_sha256"] == hashlib.sha256(system.encode()).hexdigest()
-            if "previous reply was invalid" not in user:
-                assert metadata["user_sha256"] == hashlib.sha256(user.encode()).hexdigest()
+            assert metadata["user_sha256"] == hashlib.sha256(user.encode()).hexdigest()
             systems.setdefault(decision["seat"], system)
             assert systems[decision["seat"]] == system
             archive = calls[attempt["platform_call_id"]]
@@ -221,7 +291,6 @@ for mode in [args.mode] if args.mode else ["accepted", "retry", "fallback", "gre
         if decision["action_status"] == "accepted":
             selected = next(a for a in decision["attempts"] if a["attempt_id"] == decision["selected_attempt_id"])
             assert selected["accepted"] and selected["parsed_action"] == decision["executed_action"]
-
         else:
             assert decision["selected_attempt_id"] is None
     assert len(calls) == sum(a["origin"] == "model" for d in decisions for a in d["attempts"])

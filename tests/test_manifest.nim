@@ -126,6 +126,7 @@ suite "players":
       check player["description"].getStr().len > 40
     check ids == @["trick-taking-player", "trick-taking-follow",
       "trick-taking-tracker"]
+    check manifest["player"][0]["env"]["COWORLD_LLM_ENABLED"].getStr() == "true"
 
   test "every declared player is seated in the certification fixture":
     var seated = initHashSet[string]()

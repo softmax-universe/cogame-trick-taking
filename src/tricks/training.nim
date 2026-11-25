@@ -58,10 +58,44 @@ proc recordAppliedDecision*(trajectory: DecisionTrajectory, before, after: Sim,
     if fallback: asFallback else: asAccepted, terminal = after.done,
     fallbackOrigin = if fallback: some(if fallbackReason.len > 0: fallbackReason else: proposed.policy) else: none(string))
 
-proc finishTrajectory*(trajectory: DecisionTrajectory, sim: Sim) =
-  let outcome = sim.resultsJson()
+proc recordFailedDecision*(trajectory: DecisionTrajectory, before: Sim,
+    seat: int, failed: Decision, operatorPrompt: string,
+    selection: PromptSelection) =
+  var observation = before.frameStateJson()
+  observation["prompt_template"] = selection.promptMetadata(
+    systemPrompt(before, seat, selection), userPrompt(before, operatorPrompt))
+  observation.delete("tell")
+  observation.delete("kitty")
+  observation.delete("discard")
+  for player in observation["seats"]:
+    if player["slot"].getInt() != seat:
+      player["hand"] = newJArray()
+      player["notes"] = %""
+  let status = if failed.failureKind == "player_error": asRejected else: asMissing
+  trajectory.recordDecision("event-" & $before.events.len, $seat,
+    observation, failed.nativeAttempts, none(string), newJNull(),
+    status, terminal = true)
+
+proc finishTrajectory*(trajectory: DecisionTrajectory, sim: Sim,
+    failed = false, failureInfo: JsonNode = nil) =
+  var outcome =
+    if failed:
+      %*{
+        "failed": true,
+        "module": sim.module,
+        "handsPlayed": sim.handsPlayed,
+        "handsScored": sim.handsScored,
+        "seed": sim.config.seed,
+        "failure": (if failureInfo.isNil: newJNull() else: failureInfo)
+      }
+    else:
+      sim.resultsJson()
   var participants = newJObject()
-  for seat in 0 ..< sim.config.players.len:
-    participants[$seat] = %*{"score": outcome["scores"][seat]}
-  trajectory.finish(if sim.reason == "complete": esCompleted else: esTruncated,
-    outcome, participants)
+  if not failed:
+    for seat in 0 ..< sim.config.players.len:
+      participants[$seat] = %*{"score": outcome["scores"][seat]}
+  let status =
+    if failed: esFailed
+    elif sim.reason == "complete": esCompleted
+    else: esTruncated
+  trajectory.finish(status, outcome, participants)
