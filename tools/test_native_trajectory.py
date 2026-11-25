@@ -93,6 +93,10 @@ for mode in all_modes:
             else:
                 raise AssertionError(user)
             raw = json.dumps(action, separators=(",", ":"))
+            if mode == "accepted" and len(requests) % 3 == 1:
+                raw = "Analyzing trick.\n```text\nTracking trumps\n```\n```json\n" + raw + "\n```"
+            elif mode == "accepted" and len(requests) % 3 == 2:
+                raw = "Choosing legal option.\n```json\n" + raw + "\n```"
             if mode == "invalid_output":
                 raw = "PRIVATE INVALID RESPONSE SENTINEL"
             elif mode == "ambiguous":

@@ -85,7 +85,12 @@ when isMainModule:
           ## raced the server's slot registration.
           socket.send(promptFrame())
         of "final":
-          echo "trick-taking player: final scores ", payload{"scores"}
+          if payload.hasKey("failure"):
+            echo "trick-taking player: episode failed ", payload["failure"]
+          elif payload.hasKey("scores"):
+            echo "trick-taking player: final scores ", payload["scores"]
+          else:
+            echo "trick-taking player: episode finished"
           break
         else:
           discard

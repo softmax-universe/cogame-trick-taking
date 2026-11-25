@@ -157,14 +157,22 @@ suite "fail honestly without substitute actions":
     check fenced["card"].getStr() == "10H"
     let plainFence = extractJsonObject("```\n{\"bid\": 3}\n```")
     check plainFence["bid"].getInt() == 3
-    let reasoningThenFence = extractJsonObject("Strong trump hand, ordering up.\n```json\n{\"action\": \"order\"}\n```")
+    let reasoningThenFence = extractJsonObject("Strong trump hand, ordering up.\n```json\n{\"action\": \"order\"}\n```\nDone.")
     check reasoningThenFence["action"].getStr() == "order"
+    let nonActionAndJsonFence = extractJsonObject(
+      "Reviewing table:\n```\nHand: 10H 9C\n```\n```json\n{\"card\": \"10H\"}\n```")
+    check nonActionAndJsonFence["card"].getStr() == "10H"
+    let taggedNonActionAndJsonFence = extractJsonObject(
+      "```text\nPartner void in spades\n```\n```json\n{\"card\": \"9C\"}\n```")
+    check taggedNonActionAndJsonFence["card"].getStr() == "9C"
     for bad in [
       "",
       "not json at all",
       "I think I will play {\"card\": \"10H\"} now.",
       "{\"card\": \"10H\"} trailing text",
       "```json\n{\"card\": \"10H\"}\n```\n```json\n{\"card\": \"9C\"}\n```",
+      "```json\n{\"card\": \"10H\"}\n```\n```\n{\"card\": \"9C\"}\n```",
+      "```text\nno action here\n```",
       "```json\n{\"card\": \"10H\"}",
       "[1, 2, 3]"
     ]:
@@ -208,6 +216,23 @@ suite "fail honestly without substitute actions":
       except TricksError:
         raised = true
       check raised
+    ## Legitimate illegal card (not in legal set) must still be rejected by sim.applyMove.
+    let legalSet = legalCards(sim)
+    var illegalCard = -1
+    for c in euchreDeck():
+      if c notin legalSet:
+        illegalCard = c
+        break
+    doAssert illegalCard >= 0
+    let parsedIllegal = parseDecision(sim,
+      extractJsonObject("```text\nThinking...\n```\n```json\n{\"card\": \"" & cardCode(illegalCard) & "\"}\n```"))
+    var illegalRaised = false
+    try:
+      var probe = sim
+      probe.applyMove(parsedIllegal.move, parsedIllegal.notes, false)
+    except TricksError as err:
+      illegalRaised = "is not legal here" in err.msg
+    check illegalRaised
 
   test "an unparseable reply is rejected and explicit scripted baseline move is legal":
     for module in Modules:
