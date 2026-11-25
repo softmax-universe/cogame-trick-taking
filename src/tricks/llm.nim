@@ -845,26 +845,26 @@ proc userPrompt*(sim: Sim, prompt: string): string =
 # ---- Reply parsing ----------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Parses a single JSON object directly or inside one top-level code fence.
+  ## Parses a single JSON object directly or inside one answer code fence.
   ## Never scrapes braces from prose or accepts multiple fenced blocks.
   let trimmed = text.strip()
   if trimmed.len == 0:
     raise newException(TricksError, "empty response")
   var candidate = trimmed
-  if trimmed.startsWith("```"):
-    let firstNl = trimmed.find('\n')
+  let openIdx = trimmed.find("```")
+  if openIdx >= 0:
+    let firstNl = trimmed.find('\n', openIdx)
     if firstNl < 0:
       raise newException(TricksError, "malformed code fence in response")
-    let tag = trimmed[3 ..< firstNl].strip().toLowerAscii()
+    let tag = trimmed[openIdx + 3 ..< firstNl].strip().toLowerAscii()
     if tag.len > 0 and tag != "json":
       raise newException(TricksError, "unexpected code fence language: " & tag)
-    if not trimmed.endsWith("```") or trimmed.len <= firstNl + 4:
-      raise newException(TricksError, "unclosed code fence or trailing text after fence")
-    candidate = trimmed[firstNl + 1 ..< trimmed.len - 3].strip()
-    if "```" in candidate:
+    let closeIdx = trimmed.find("```", firstNl + 1)
+    if closeIdx < 0:
+      raise newException(TricksError, "unclosed code fence in response")
+    if trimmed.find("```", closeIdx + 3) >= 0:
       raise newException(TricksError, "ambiguous response: multiple code fences")
-  elif "```" in trimmed:
-    raise newException(TricksError, "ambiguous response: unexpected text outside code fence")
+    candidate = trimmed[firstNl + 1 ..< closeIdx].strip()
   var parsed: JsonNode
   try:
     parsed = parseJson(candidate)

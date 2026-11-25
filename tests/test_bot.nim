@@ -157,13 +157,15 @@ suite "fail honestly without substitute actions":
     check fenced["card"].getStr() == "10H"
     let plainFence = extractJsonObject("```\n{\"bid\": 3}\n```")
     check plainFence["bid"].getInt() == 3
+    let reasoningThenFence = extractJsonObject("Strong trump hand, ordering up.\n```json\n{\"action\": \"order\"}\n```")
+    check reasoningThenFence["action"].getStr() == "order"
     for bad in [
       "",
       "not json at all",
       "I think I will play {\"card\": \"10H\"} now.",
       "{\"card\": \"10H\"} trailing text",
       "```json\n{\"card\": \"10H\"}\n```\n```json\n{\"card\": \"9C\"}\n```",
-      "Here:\n```json\n{\"card\": \"10H\"}\n```",
+      "```json\n{\"card\": \"10H\"}",
       "[1, 2, 3]"
     ]:
       var raised = false
