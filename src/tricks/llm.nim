@@ -43,16 +43,21 @@ const
   Baselines* = ["follow", "tracker"]
 
 type
+  LlmTransportError* = object of TricksError
+
   Decision* = object
     nativeAttempts*: seq[DecisionAttempt]
     policy*: string
     submittedResponse*: string
     move*: Move
     notes*: string
-    scripted*: bool     ## decided by the baseline rather than the model
+    scripted*: bool     ## decided by an explicit scripted baseline seat
     fallback*: bool
-    forced*: bool       ## the baseline move was rejected; lowest legal used
-    error*: string      ## recorded on a fallback, rune-truncated
+    forced*: bool       ## single legal card or baseline fallback
+    failed*: bool       ## decision failed; episode must terminate without scores
+    failureKind*: string ## "player_error" | "episode_inconclusive"
+    rawOutput*: string  ## raw model or player output preserved on failure
+    error*: string      ## recorded on failure, rune-truncated
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -63,8 +68,7 @@ type
     apiKey: string
     sidecarEndpoint: string
     bedrockEndpoint: string
-    bedrockModels: seq[string]
-    bedrockModel: int
+    bedrockModel: string
     bedrockToken: string
     model: string
     maxOutputTokens: int
@@ -87,31 +91,8 @@ proc resolveApiKey(): string =
     echo "trick-taking llm: failed to fetch ANTHROPIC_API_KEY_URI"
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## `us.anthropic.claude-sonnet-4-6` is deliberately NOT in this list: it
-  ## times out on every sidecar call (raid, 2026-08-23), and one throttle
-  ## cascades into scripted fallbacks.
-  let pinned = getEnv("BEDROCK_MODEL").strip()
-  if pinned.len > 0:
-    return @[pinned]
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "trick-taking llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
-
-proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+proc bedrockUrl(client: LlmClient, modelId: string): string =
+  client.bedrockEndpoint & "/model/" & modelId & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -127,8 +108,16 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   if sidecarEndpoint.len > 0:
     result.transport = ltSidecar
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
-    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
+    if config.modelExplicit:
+      result.model = config.model
+    else:
+      let envModel = getEnv("COWORLD_LLM_MODEL").strip()
+      if envModel.len > 0:
+        result.model = envModel
+      elif result.model.len == 0:
+        result.model = "anthropic/claude-haiku-4.5"
     result.curl = newCurly()
+    echo "trick-taking llm: sidecar transport, model ", result.model
     return
   let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
   let bedrockToken = getEnv("AWS_BEARER_TOKEN_BEDROCK").strip()
@@ -140,10 +129,15 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    let pinned = getEnv("BEDROCK_MODEL").strip()
+    result.bedrockModel =
+      if config.modelExplicit: config.model
+      elif pinned.len > 0: pinned
+      else: "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    result.model = result.bedrockModel
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
-    echo "trick-taking llm: bedrock transport, url ", result.bedrockUrl
+    echo "trick-taking llm: bedrock transport, url ", result.bedrockUrl(result.bedrockModel)
     return
   result.apiKey = resolveApiKey()
   if result.apiKey.len > 0:
@@ -153,7 +147,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "trick-taking llm: no LLM credentials; using scripted fallback"
+    echo "trick-taking llm: no LLM backend configured; model seats will fail"
 
 proc noteThrottled*(client: LlmClient) =
   ## A 429 raises the decision spacing for the rest of the episode, up to
@@ -162,10 +156,9 @@ proc noteThrottled*(client: LlmClient) =
     min(client.extraSpacingMs + ThrottleExtraMs, MaxExtraSpacingMs)
 
 proc worstCaseCallSeconds*(client: LlmClient): float =
-  ## The longest a single `decide` can take on the model path: one attempt,
-  ## one retry, each bounded by the transport timeout. The caller uses it to
-  ## refuse a call that would not return before the hard deadline.
-  (2 * client.timeoutSeconds).float
+  ## The longest a single `decide` can take on the model path: one attempt
+  ## bounded by the transport timeout.
+  client.timeoutSeconds.float
 
 # ---- Scripted baselines -----------------------------------------------------
 #
@@ -770,68 +763,60 @@ proc trumpText(sim: Sim): string =
 
 proc legalCardText(sim: Sim): string =
   var parts: seq[string]
-  var index = 1
   for card in legalCards(sim):
-    parts.add($index & ") " & cardCode(card))
-    inc index
-  parts.join("  ")
+    parts.add(cardCode(card))
+  parts.join(", ")
 
 proc optionInstruction(sim: Sim): string =
   case sim.phase
   of phPlay:
-    "YOUR LEGAL CARDS (pick exactly one): " & legalCardText(sim) &
-      "\n\nReply with ONLY {\"card\": \"10H\", \"notes\": \"...\"} -- one " &
-      "card code from the legal list above (write ten as 10, never T); " &
-      "notes at most " & $MaxNotesLen & " characters."
+    "YOUR LEGAL CARDS (pick one): " & legalCardText(sim) &
+      "\n\nReply with JSON: {\"card\": \"10H\"} (optional \"notes\" up to " &
+      $MaxNotesLen & " chars; write ten as 10, never T)."
   of phDiscard:
-    "You picked up the up-card and must now discard ONE card face down. " &
+    "You picked up the up-card and must discard one card face down. " &
       "Your hand: " & handCodes(sim.deal[sim.actorSlot]) &
-      "\n\nReply with ONLY {\"card\": \"9C\", \"notes\": \"...\"}."
+      "\n\nReply with JSON: {\"card\": \"9C\"} (optional \"notes\")."
   of phPass:
-    "Choose EXACTLY 3 distinct cards from your hand to pass " & sim.passDir &
-      ".\n\nReply with ONLY {\"cards\": [\"QS\", \"2H\", \"AD\"], " &
-      "\"notes\": \"...\"}."
+    "Choose 3 distinct cards from your hand to pass " & sim.passDir &
+      ".\n\nReply with JSON: {\"cards\": [\"QS\", \"2H\", \"AD\"]} (optional \"notes\")."
   of phBid:
     if sim.module == "euchre":
       if sim.bidRound == 1:
-        "The up-card is " & cardCode(sim.upcard) & ". You may: " &
-          "\"pass\"; \"order\" (make " & suitName(suitOf(sim.upcard)) &
-          " trump); or \"alone\" (make it trump and play without your " &
-          "partner).\n\nReply with ONLY {\"action\": \"order\", " &
-          "\"notes\": \"...\"}."
+        "The up-card is " & cardCode(sim.upcard) & ". Choose " &
+          "\"pass\", \"order\" (make " & suitName(suitOf(sim.upcard)) &
+          " trump), or \"alone\" (make it trump and play without your " &
+          "partner).\n\nReply with JSON: {\"action\": \"order\"} (optional \"notes\")."
       else:
         var suits: seq[string]
         for move in legalMoves(sim):
           if move.action == "name":
             suits.add(suitName(move.suit))
         (if sim.stuck:
-            "Everyone has passed and STICK THE DEALER is on: you are the " &
-              "dealer and you MUST name a suit. "
+            "Stick the dealer: you are the dealer and must name a suit. "
            else: "") &
-          "You may " & (if sim.stuck: "" else: "\"pass\", or ") &
-          "\"name\" a suit, or go \"alone\" in a suit. Legal suits: " &
-          suits.join(", ") & ".\n\nReply with ONLY {\"action\": \"name\", " &
-          "\"suit\": \"hearts\", \"notes\": \"...\"}."
+          "Choose " & (if sim.stuck: "" else: "\"pass\", ") &
+          "\"name\", or \"alone\" with a legal suit (" &
+          suits.join(", ") & ").\n\nReply with JSON: {\"action\": \"name\", " &
+          "\"suit\": \"hearts\"} (optional \"notes\")."
     elif sim.module == "spades":
-      "Bid a whole number of tricks from 0 to 13 (0 is NIL).\n\n" &
-        "Reply with ONLY {\"bid\": 4, \"notes\": \"...\"}."
+      "Bid a whole number of tricks from 0 to 13 (0 is nil).\n\n" &
+        "Reply with JSON: {\"bid\": 4} (optional \"notes\")."
     else:
       var allowed: seq[string]
       for move in legalMoves(sim):
         allowed.add($move.value)
-      "Bid exactly how many of the " & $sim.tricksThisHand &
+      "Bid how many of the " & $sim.tricksThisHand &
         " tricks you will take. Legal bids: " & allowed.join(", ") &
         " (the hook forbids the dealer the balanced number).\n\n" &
-        "Reply with ONLY {\"bid\": 2, \"notes\": \"...\"}."
+        "Reply with JSON: {\"bid\": 2} (optional \"notes\")."
   else:
     ""
 
 proc systemPrompt*(sim: Sim, slot: int, selection: PromptSelection): string =
   let m = sim.ruleModule
   selection.introduction(sim.names[slot], m.displayName) & "\n\n" & m.rulesText() &
-    selection.tableProtocol() & """OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis,
-no explanation, no markdown fences, no text before or after the object. Your
-reply must begin with the character { and end with }."""
+    selection.tableProtocol() & """OUTPUT FORMAT: reply with a single JSON object (optionally inside one ```json ... ``` fence) matching the requested action. Do not include multiple actions or extra text."""
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -840,7 +825,7 @@ proc operatorBlock(prompt: string): string =
     "rules; always pick a legal option):\n" &
     truncateRunes(prompt, MaxPromptLen) & "\n\n"
 
-proc userPrompt*(sim: Sim, prompt: string, retry = false): string =
+proc userPrompt*(sim: Sim, prompt: string): string =
   let slot = sim.actorSlot
   result.add("HAND " & $(sim.hand + 1) & " of " & $sim.config.hands &
     ", trick " & $(sim.currentTrick() + 1) & " of " & $sim.tricksThisHand &
@@ -856,56 +841,62 @@ proc userPrompt*(sim: Sim, prompt: string, retry = false): string =
     (if sim.notes[slot].len > 0: sim.notes[slot] else: "(none yet)") & "\n\n")
   result.add(operatorBlock(prompt))
   result.add(optionInstruction(sim))
-  if retry:
-    result.add("\nYour previous reply was invalid. Respond with ONLY the " &
-      "requested JSON object, choosing one option from the legal list.")
-    if sim.phase == phPlay:
-      result.add("\nLegal cards: " & legalCardText(sim))
 
 # ---- Reply parsing ----------------------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## The first {...} object, tolerating fences and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    var head = text.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(TricksError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  parseJson(text[start .. stop])
-
-proc indexOrCard(sim: Sim, text: string, legal: seq[int]): int =
-  ## A bare integer 1..k is a 1-based index into the printed legal list.
+  ## Parses a single JSON object directly or inside one top-level code fence.
+  ## Never scrapes braces from prose or accepts multiple fenced blocks.
   let trimmed = text.strip()
-  if trimmed.len > 0 and trimmed.len <= 2 and
-      trimmed.allCharsInSet({'0' .. '9'}):
-    let index = parseInt(trimmed)
-    if index >= 1 and index <= legal.len:
-      return legal[index - 1]
-  parseCard(truncateRunes(trimmed, 24))
+  if trimmed.len == 0:
+    raise newException(TricksError, "empty response")
+  var candidate = trimmed
+  if trimmed.startsWith("```"):
+    let firstNl = trimmed.find('\n')
+    if firstNl < 0:
+      raise newException(TricksError, "malformed code fence in response")
+    let tag = trimmed[3 ..< firstNl].strip().toLowerAscii()
+    if tag.len > 0 and tag != "json":
+      raise newException(TricksError, "unexpected code fence language: " & tag)
+    if not trimmed.endsWith("```") or trimmed.len <= firstNl + 4:
+      raise newException(TricksError, "unclosed code fence or trailing text after fence")
+    candidate = trimmed[firstNl + 1 ..< trimmed.len - 3].strip()
+    if "```" in candidate:
+      raise newException(TricksError, "ambiguous response: multiple code fences")
+  elif "```" in trimmed:
+    raise newException(TricksError, "ambiguous response: unexpected text outside code fence")
+  var parsed: JsonNode
+  try:
+    parsed = parseJson(candidate)
+  except CatchableError as error:
+    raise newException(TricksError, "invalid JSON in response: " & error.msg)
+  if parsed.kind != JObject:
+    raise newException(TricksError, "response must be a JSON object")
+  parsed
+
+proc rejectConflictingKeys(payload: JsonNode, forbidden: openArray[string]) =
+  for key in forbidden:
+    if payload.hasKey(key) and payload[key].kind != JNull:
+      raise newException(TricksError, "ambiguous action key: " & key)
 
 proc parseDecision*(sim: Sim, payload: JsonNode): Decision =
-  result.notes = cleanNotes(payload{"notes"}.getStr())
+  if payload.isNil or payload.kind != JObject:
+    raise newException(TricksError, "reply must be a JSON object")
+  if payload.hasKey("notes") and payload["notes"].kind != JNull:
+    if payload["notes"].kind != JString:
+      raise newException(TricksError, "notes must be a string")
+    result.notes = cleanNotes(payload["notes"].getStr())
   case sim.phase
   of phPlay, phDiscard:
-    let legal = legalCards(sim)
+    rejectConflictingKeys(payload, ["cards", "bid", "action", "suit"])
     let node = payload{"card"}
-    if node.isNil:
-      raise newException(TricksError, "no card in the reply")
-    var card = -1
-    if node.kind == JInt:
-      let index = node.getInt()
-      if index >= 1 and index <= legal.len:
-        card = legal[index - 1]
-      else:
-        raise newException(TricksError, "card index out of range")
-    else:
-      card = indexOrCard(sim, node.getStr(), legal)
+    if node.isNil or node.kind != JString:
+      raise newException(TricksError, "card must be a card code string")
+    let card = parseCard(truncateRunes(node.getStr().strip(), 24))
     result.move =
       (if sim.phase == phPlay: playMove(card) else: discardMove(card))
   of phPass:
+    rejectConflictingKeys(payload, ["card", "bid", "action", "suit"])
     let node = payload{"cards"}
     if node.isNil or node.kind != JArray:
       raise newException(TricksError, "no cards array in the reply")
@@ -913,42 +904,57 @@ proc parseDecision*(sim: Sim, payload: JsonNode): Decision =
       raise newException(TricksError, "a hearts pass is exactly three cards")
     var cards: seq[int]
     for entry in node:
-      cards.add(parseCard(truncateRunes(entry.getStr(), 24)))
+      if entry.kind != JString:
+        raise newException(TricksError, "each passed card must be a card code string")
+      cards.add(parseCard(truncateRunes(entry.getStr().strip(), 24)))
     result.move = passMove(cards)
   of phBid:
     if sim.module == "euchre":
-      var action = truncateRunes(
-        payload{"action"}.getStr().strip(), MaxAliasLen).toLowerAscii()
-      if action.len == 0 and payload.hasKey("bid"):
-        action = "pass"
+      rejectConflictingKeys(payload, ["card", "cards", "bid"])
+      let actionNode = payload{"action"}
+      if actionNode.isNil or actionNode.kind != JString:
+        raise newException(TricksError, "action must be a string")
+      let action = truncateRunes(
+        actionNode.getStr().strip(), MaxAliasLen).toLowerAscii()
+      var hasSuit = false
       var suit = -1
-      if payload.hasKey("suit"):
-        suit = parseSuit(truncateRunes(payload{"suit"}.getStr(), 8))
+      if payload.hasKey("suit") and payload["suit"].kind != JNull:
+        if payload["suit"].kind != JString:
+          raise newException(TricksError, "suit must be a string")
+        let suitText = payload["suit"].getStr().strip()
+        if suitText.len > 0:
+          hasSuit = true
+          suit = parseSuit(truncateRunes(suitText, 16))
       case action
-      of "pass": result.move = bidMove("pass", 0, -1)
-      of "order", "order it up", "orderup":
+      of "pass":
+        if hasSuit:
+          raise newException(TricksError, "ambiguous pass with suit")
+        result.move = bidMove("pass", 0, -1)
+      of "order":
+        if hasSuit and suit != suitOf(sim.upcard):
+          raise newException(TricksError, "order suit does not match up-card")
         result.move = bidMove("order", 0, suitOf(sim.upcard))
-      of "alone", "go alone", "loner":
-        result.move = bidMove("alone", 0,
-          (if sim.bidRound == 1: suitOf(sim.upcard) else: suit))
-      of "name", "call", "make":
+      of "alone":
+        if sim.bidRound == 1:
+          if hasSuit and suit != suitOf(sim.upcard):
+            raise newException(TricksError, "alone suit does not match up-card")
+          result.move = bidMove("alone", 0, suitOf(sim.upcard))
+        else:
+          if not hasSuit:
+            raise newException(TricksError, "alone in round 2 requires a suit")
+          result.move = bidMove("alone", 0, suit)
+      of "name":
+        if not hasSuit:
+          raise newException(TricksError, "name requires a suit")
         result.move = bidMove("name", 0, suit)
       else:
         raise newException(TricksError, "unknown euchre action: " & action)
     else:
+      rejectConflictingKeys(payload, ["card", "cards", "action", "suit"])
       let node = payload{"bid"}
-      if node.isNil:
-        raise newException(TricksError, "no bid in the reply")
-      var value = -1
-      if node.kind == JInt:
-        value = node.getInt()
-      elif node.kind == JString:
-        try:
-          value = parseInt(node.getStr().strip())
-        except ValueError:
-          raise newException(TricksError, "bid is not a number")
-      else:
-        raise newException(TricksError, "bid is not a number")
+      if node.isNil or node.kind != JInt:
+        raise newException(TricksError, "bid must be an integer")
+      let value = node.getInt()
       let top = (if sim.module == "spades": 13 else: sim.tricksThisHand)
       if value < 0 or value > top:
         raise newException(TricksError, "bid out of range: " & $value)
@@ -972,7 +978,7 @@ proc decisionAction*(sim: Sim, decision: Decision): JsonNode =
     else: result["bid"] = %decision.move.value
   of mkNone: raise newException(ValueError, "not a decision move")
 
-proc completeText(client: LlmClient, system, user: string, slot: int,
+proc completeText(client: LlmClient, model, system, user: string, slot: int,
     evidence: var DecisionAttempt): string =
   var body = %*{
     "max_tokens": client.maxOutputTokens,
@@ -989,16 +995,16 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
     body["anthropic_version"] = %BedrockAnthropicVersion
     if client.bedrockToken.len > 0:
       headers["authorization"] = "Bearer " & client.bedrockToken
-    url = client.bedrockUrl()
+    url = client.bedrockUrl(model)
   elif client.transport == ltSidecar:
-    body["model"] = %client.model
+    body["model"] = %model
     headers["anthropic-version"] = AnthropicVersion
     url = client.sidecarEndpoint & "/v1/messages"
   else:
-    body["model"] = %client.model
+    body["model"] = %model
     ## Haiku 4.5 rejects the whole request with a 400 when an effort
     ## setting is present.
-    if "haiku" notin client.model and "4-5" notin client.model:
+    if "haiku" notin model and "4-5" notin model:
       body["output_config"] = %*{"effort": "low"}
     headers["x-api-key"] = client.apiKey
     headers["anthropic-version"] = AnthropicVersion
@@ -1008,7 +1014,12 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
   evidence.decoder = %*{"temperature": temperature,
     "max_tokens": client.maxOutputTokens, "timeout_ms": client.timeoutSeconds * 1000}
   let started = epochTime()
-  let response = client.curl.post(url, headers, $body, client.timeoutSeconds)
+  var response: curly.Response
+  try:
+    response = client.curl.post(url, headers, $body, client.timeoutSeconds)
+  except CatchableError as error:
+    evidence.latencyMs = some((epochTime() - started) * 1000)
+    raise newException(LlmTransportError, "llm transport error at " & url & ": " & error.msg)
   evidence.latencyMs = some((epochTime() - started) * 1000)
   evidence.rawResponse = %response.body
   for (header, field) in [
@@ -1024,28 +1035,31 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
       of "template": evidence.chatTemplateSha256 = some(response.headers[header])
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(TricksError,
-        "bedrock model access denied: " & detail)
-    client.disabled = true
-    raise newException(TricksError,
+    raise newException(LlmTransportError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
     client.noteThrottled()
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(TricksError, "llm throttled (429): " & detail)
+    raise newException(LlmTransportError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(TricksError, "anthropic error " & $response.code &
+    raise newException(LlmTransportError, "llm backend error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as error:
+    raise newException(LlmTransportError, "llm backend returned invalid JSON: " & error.msg)
   evidence.rawResponse = payload
-  evidence.model = some(payload["model"].getStr())
-  evidence.stopReason = some(payload["stop_reason"].getStr())
-  evidence.inputTokens = some(payload["usage"]["input_tokens"].getInt())
-  evidence.outputTokens = some(payload["usage"]["output_tokens"].getInt())
-  if payload.hasKey("sampling_evidence") and payload["sampling_evidence"].kind != JNull:
+  if payload.hasKey("model") and payload["model"].kind == JString:
+    evidence.model = some(payload["model"].getStr())
+  if payload.hasKey("stop_reason") and payload["stop_reason"].kind == JString:
+    evidence.stopReason = some(payload["stop_reason"].getStr())
+  if payload.hasKey("usage") and payload["usage"].kind == JObject:
+    if payload["usage"].hasKey("input_tokens") and payload["usage"]["input_tokens"].kind == JInt:
+      evidence.inputTokens = some(payload["usage"]["input_tokens"].getInt())
+    if payload["usage"].hasKey("output_tokens") and payload["usage"]["output_tokens"].kind == JInt:
+      evidence.outputTokens = some(payload["usage"]["output_tokens"].getInt())
+  if payload.hasKey("sampling_evidence") and payload["sampling_evidence"].kind == JObject:
     let sampled = payload["sampling_evidence"]
     var promptTokens, completionTokens: seq[int]
     var probabilities: seq[float]
@@ -1058,18 +1072,17 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
       evidence.behaviorLogprobs = some(probabilities)
     evidence.stopReason = some(sampled["stop_reason"].getStr())
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(TricksError, "anthropic refusal")
-  for contentBlock in payload["content"]:
-    if contentBlock{"type"}.getStr() == "text":
-      result.add(contentBlock{"text"}.getStr())
+    raise newException(LlmTransportError, "llm refusal")
+  if payload.hasKey("content") and payload["content"].kind == JArray:
+    for contentBlock in payload["content"]:
+      if contentBlock{"type"}.getStr() == "text":
+        result.add(contentBlock{"text"}.getStr())
   evidence.response = %result
-  if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(TricksError, "reply cut off at max_tokens before " &
-      "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
+  if payload{"stop_reason"}.getStr() == "max_tokens":
+    raise newException(LlmTransportError, "reply truncated at max_tokens")
 
 proc baselineDecision*(sim: Sim, baseline: string, why = ""): Decision =
-  ## The seat's scripted baseline move; if the engine somehow rejects it,
-  ## the lowest legal option is forced.
+  ## Explicit scripted baseline move.
   result.scripted = true
   result.policy = "scripted-" & baseline
   result.fallback = why.len > 0
@@ -1089,50 +1102,62 @@ proc decide*(
   prompt: string,
   scripted: bool,
   baseline: string,
-  selection: PromptSelection
+  selection: PromptSelection,
+  seatModel = ""
 ): Decision =
-  ## One decision for one seat. Never raises: any failure falls back to the
-  ## scripted baseline, and a rejected baseline falls back to the lowest
-  ## legal option, so the episode always advances.
-  if scripted or client.disabled:
-    result = baselineDecision(sim, baseline)
-    result.fallback = not scripted
-    return
+  ## One decision for one seat. Explicit scripted seats use their baseline;
+  ## model seats execute a single real LLM call and return a failed Decision
+  ## (never a substitute scripted move) on backend, model, parse, or legality error.
+  if scripted:
+    return baselineDecision(sim, baseline)
+  let chosenModel = if seatModel.len > 0: seatModel else: client.model
+  if client.transport == ltNone or client.disabled:
+    return Decision(
+      failed: true,
+      failureKind: "episode_inconclusive",
+      policy: chosenModel,
+      error: "no LLM backend configured (COWORLD_LLM_ENDPOINT or provider credentials required)"
+    )
   let slot = sim.actorSlot
   let system = systemPrompt(sim, slot, selection)
-  var lastError = ""
-  for attempt in 0 .. 1:
-    let user = userPrompt(sim, prompt, retry = attempt > 0)
-    var evidence = newDecisionAttempt("event-" & $sim.events.len & "-attempt-" & $attempt,
-      client.model, aoModel)
-    evidence.prompt = %*[{"role": "system", "content": system},
-      {"role": "user", "content": user}]
-    try:
-      let payload = extractJsonObject(client.completeText(system, user, slot, evidence))
-      var decision = parseDecision(sim, payload)
-      ## Reject an illegal reply here so the retry carries the hint.
-      var probe = sim
-      probe.applyMove(decision.move, decision.notes, false)
-      decision.scripted = false
-      evidence.parsedAction = sim.decisionAction(decision)
-      evidence.accepted = true
-      result.nativeAttempts.add(evidence)
-      decision.nativeAttempts = result.nativeAttempts
-      decision.policy = client.model
-      return decision
-    except CatchableError as error:
-      evidence.rejectionReason = some(error.msg)
-      result.nativeAttempts.add(evidence)
-      lastError = error.msg
-      echo "trick-taking llm: slot ", slot, " attempt ", attempt,
-        " rejected"
-      if client.disabled:
-        break
-      if "429" in error.msg:
-        ## No retry on a throttle: take the scripted move immediately.
-        break
-  echo "trick-taking llm: slot ", slot, " falling back to a scripted decision"
-  let attempts = result.nativeAttempts
-  result = baselineDecision(sim, baseline, lastError)
-  result.fallback = true
-  result.nativeAttempts = attempts
+  let user = userPrompt(sim, prompt)
+  var evidence = newDecisionAttempt("event-" & $sim.events.len & "-attempt-0",
+    chosenModel, aoModel)
+  evidence.prompt = %*[{"role": "system", "content": system},
+    {"role": "user", "content": user}]
+  var rawText = ""
+  try:
+    rawText = client.completeText(chosenModel, system, user, slot, evidence)
+    let payload = extractJsonObject(rawText)
+    var decision = parseDecision(sim, payload)
+    var probe = sim
+    probe.applyMove(decision.move, decision.notes, false)
+    decision.scripted = false
+    decision.submittedResponse = rawText
+    evidence.parsedAction = sim.decisionAction(decision)
+    evidence.accepted = true
+    decision.nativeAttempts = @[evidence]
+    decision.policy = chosenModel
+    return decision
+  except LlmTransportError as error:
+    evidence.rejectionReason = some(error.msg)
+    echo "trick-taking llm: slot ", slot, " backend failure: ", error.msg
+    return Decision(
+      failed: true,
+      failureKind: "episode_inconclusive",
+      policy: chosenModel,
+      rawOutput: rawText,
+      error: truncateRunes(error.msg, MaxErrorLen),
+      nativeAttempts: @[evidence]
+    )
+  except CatchableError as error:
+    evidence.rejectionReason = some(error.msg)
+    echo "trick-taking llm: slot ", slot, " invalid response: ", error.msg
+    return Decision(
+      failed: true,
+      failureKind: "player_error",
+      policy: chosenModel,
+      rawOutput: rawText,
+      error: truncateRunes(error.msg, MaxErrorLen),
+      nativeAttempts: @[evidence]
+    )

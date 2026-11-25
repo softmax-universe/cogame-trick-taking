@@ -66,7 +66,11 @@ network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
 
+mock_pid=""
 cleanup() {
+  if [ -n "${mock_pid}" ]; then
+    kill "${mock_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,11 +195,78 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: using provided sidecar"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  echo "no external LLM credentials: starting local mock /v1/messages server for real HTTP-to-game smoke"
+  python3 - "${work_dir}/mock_port" <<'PY' &
+import json, re, sys, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class MockLLM(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+    def do_POST(self):
+        if self.path != "/v1/messages":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        user = body["messages"][0]["content"]
+        action = {"notes": "smoke"}
+        if "YOUR LEGAL CARDS (pick one): " in user:
+            legal = user.split("YOUR LEGAL CARDS (pick one): ", 1)[1].split("\n", 1)[0]
+            action["card"] = legal.split(",")[0].strip()
+        elif "Legal bids: " in user:
+            action["bid"] = int(re.search(r"Legal bids: (\d+)", user).group(1))
+        elif "Choose 3 distinct cards" in user:
+            action["cards"] = user.split("YOUR HAND: ", 1)[1].split("\n", 1)[0].split()[:3]
+        elif "must discard one card" in user:
+            action["card"] = user.split("Your hand: ", 1)[1].split("\n", 1)[0].split()[0]
+        elif "with a legal suit (" in user:
+            suit = user.split("with a legal suit (", 1)[1].split(")", 1)[0].split(",")[0].strip()
+            action.update(action="name", suit=suit)
+        elif '"order" (make ' in user:
+            action["action"] = "order"
+        elif "Bid a whole number of tricks" in user:
+            action["bid"] = 0
+        else:
+            action["action"] = "pass"
+        resp = {
+            "id": str(uuid.uuid4()),
+            "type": "message",
+            "role": "assistant",
+            "model": body.get("model", "mock/trick-taking"),
+            "content": [{"type": "text", "text": json.dumps(action)}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 16},
+        }
+        payload = json.dumps(resp).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+srv = ThreadingHTTPServer(("0.0.0.0", 0), MockLLM)
+with open(sys.argv[1], "w") as fh:
+    fh.write(str(srv.server_port))
+srv.serve_forever()
+PY
+  mock_pid="$!"
+  for _ in $(seq 1 50); do
+    [ -s "${work_dir}/mock_port" ] && break
+    sleep 0.1
+  done
+  mock_port="$(cat "${work_dir}/mock_port")"
+  game_env+=(--add-host=host.docker.internal:host-gateway -e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${mock_port}" -e "COWORLD_LLM_MODEL=mock/trick-taking")
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."

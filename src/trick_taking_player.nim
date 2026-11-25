@@ -45,10 +45,14 @@ when isMainModule:
   var baseline = scriptedEnv.toLowerAscii()
   if baseline notin Baselines:
     baseline = "follow"
+  let llmModel = if scripted: "" else: getEnv("COWORLD_LLM_MODEL").strip()
 
   proc promptFrame(): string =
-    $ %*{"type": "prompt", "prompt": prompt,
+    var frame = %*{"type": "prompt", "prompt": prompt,
       "scripted": scripted, "baseline": baseline}
+    if llmModel.len > 0:
+      frame["model"] = %llmModel
+    $frame
 
   echo "trick-taking player: connecting to game"
   let socket = newWebSocket(url)

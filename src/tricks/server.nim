@@ -50,8 +50,10 @@ type
     config: GameConfig
     sim: Sim
     prompts: seq[string]
+    seatModels: seq[string]
     scripted: seq[bool]
     external: seq[bool]
+    registered: seq[bool]
     decisionId: int
     pendingAction: JsonNode
     baselines: seq[string]
@@ -200,6 +202,70 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "trick-taking: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(runtimeConfig: RuntimeConfig, slot: int, kind, message: string,
+    rawOutput = "") =
+  var replayData: string
+  let normalizedKind =
+    if kind == "player_error": "player_error" else: "episode_inconclusive"
+  let safeSlot = max(0, min(slot, Seats - 1))
+  let safeMsg =
+    if message.strip().len > 0: truncateRunes(message.strip(), 1900)
+    else: "episode failed"
+  let failureInfo = %*{
+    "kind": normalizedKind,
+    "slot": safeSlot,
+    "message": safeMsg,
+    "rawOutput": truncateRunes(rawOutput, 4000)
+  }
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    if state.trajectory.isSome:
+      state.trajectory.get().finishTrajectory(state.sim, failed = true,
+        failureInfo = failureInfo)
+      state.trajectory.get().writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+    var payload = state.sim.replayJson()
+    payload["failure"] = failureInfo
+    replayData = $payload
+    var final = %*{
+      "type": "final",
+      "done": true,
+      "failed": true,
+      "failure": failureInfo
+    }
+    for playerSlot, socket in state.playerSockets:
+      final["slot"] = %playerSlot
+      try:
+        socket.send($final)
+      except CatchableError:
+        discard
+    state.broadcastLocked()
+
+  sleep(500)
+  echo "trick-taking: episode failed (", normalizedKind, ", slot=", safeSlot,
+    "): ", safeMsg
+  ## Preserve partial replay and typed failure.json; never write default results.json.
+  if runtimeConfig.replayUri.len > 0:
+    try:
+      writeArtifact(runtimeConfig.replayUri, replayData,
+        "application/octet-stream", "COGAME_SAVE_REPLAY_METHOD")
+    except CatchableError as error:
+      echo "trick-taking: failed to write partial replay: ", error.msg
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    let playerFailure = %*{
+      "message": safeMsg,
+      "failed_policy_index": safeSlot,
+      "kind": normalizedKind
+    }
+    try:
+      writeArtifact(failureUri, $playerFailure, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD")
+    except CatchableError as error:
+      echo "trick-taking: failed to write player_failure.json: ", error.msg
+  quit(1)
+
 proc decisionText(sim: Sim, call: Call, decision: Decision): string =
   if call.slot < 0:
     return ""
@@ -221,24 +287,42 @@ proc runEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     let connectDeadline = gameStart + config.playerConnectTimeoutSeconds
 
     while epochTime() < connectDeadline:
-      var allConnected = false
+      var allReady = false
       withLock stateLock:
-        allConnected = state.playerSockets.len >= config.tokens.len
-      if allConnected:
+        allReady = state.playerSockets.len >= config.tokens.len
+        if allReady:
+          for slot in 0 ..< config.tokens.len:
+            if not state.registered[slot]:
+              allReady = false
+              break
+      if allReady:
         break
-      sleep(200)
+      sleep(100)
 
+    var missingSlot = -1
+    var missingReason = ""
     withLock stateLock:
-      state.started = true
-      echo "trick-taking: starting with ", state.playerSockets.len, "/",
-        config.tokens.len, " players connected"
-      state.broadcastLocked()
+      for slot in 0 ..< config.tokens.len:
+        if not state.playerSockets.hasKey(slot):
+          missingSlot = slot
+          missingReason = "player slot " & $slot & " did not connect within timeout"
+          break
+        if not state.registered[slot]:
+          missingSlot = slot
+          missingReason = "player slot " & $slot & " connected but did not register"
+          break
+      if missingSlot < 0:
+        state.started = true
+        echo "trick-taking: starting with ", state.playerSockets.len, "/",
+          config.tokens.len, " players connected"
+        state.broadcastLocked()
+
+    if missingSlot >= 0:
+      failEpisode(runtimeConfig, missingSlot, "player_error", missingReason)
+      return
 
     let client = newLlmClient(config)
 
-    ## The hosted dispatcher hands the timeout only to its own worker
-    ## sidecar, NOT to the game container, so when the env is silent assume
-    ## the configured platform default rather than playing open-ended.
     let hostedTimeout = getEnv("COWORLD_TIMEOUT_SECONDS", "").strip()
     var timeoutSeconds =
       if hostedTimeout.len > 0:
@@ -261,12 +345,14 @@ proc runEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var call: Call
       var simCopy: Sim
       var seatPrompt: string
+      var seatModel: string
       var seatScripted = false
       var seatExternal = false
       var decisionId = 0
       var baseline = "follow"
       var settled = false
       var paceTrick = false
+      var inconclusiveStop = ""
 
       withLock stateLock:
         if state.sim.done:
@@ -285,24 +371,30 @@ proc runEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             settled = true
           elif call.kind == ckDeal:
             if stopReason.len > 0:
-              echo "trick-taking: settling after ", state.sim.handsScored,
-                "/", config.hands, " hands (", stopReason, ")"
-              state.sim.endEarly(stopReason)
-              state.broadcastLocked()
-              settled = true
+              if state.sim.handsScored > 0:
+                echo "trick-taking: settling after ", state.sim.handsScored,
+                  "/", config.hands, " hands (", stopReason, ")"
+                state.sim.endEarly(stopReason)
+                state.broadcastLocked()
+                settled = true
+              else:
+                inconclusiveStop = "episode stopped before any hand was scored (" & stopReason & ")"
             else:
               state.sim.beginHand()
               echo "trick-taking: hand ", state.sim.hand + 1, " of ",
                 config.hands, " at ", (epochTime() - gameStart).int, "s"
               state.broadcastLocked()
-          elif pastHard:
-            ## The hand in progress is abandoned: not scored, excluded from
-            ## H and from NORM. A recorded event, so the replay re-derives.
-            echo "trick-taking: hard deadline; voiding hand ",
-              state.sim.hand + 1
+          elif pastHard or stopReason.len > 0:
+            ## Never substitute scripted actions for LLM seats on deadline/budget.
+            echo "trick-taking: ", (if pastHard: "hard deadline" else: stopReason),
+              "; voiding hand ", state.sim.hand + 1
             state.sim.voidHand()
             state.broadcastLocked()
-            settled = true
+            if state.sim.handsScored > 0:
+              settled = true
+            else:
+              inconclusiveStop = "episode stopped mid-hand with no hands scored (" &
+                (if stopReason.len > 0: stopReason else: "deadline") & ")"
           else:
             let forced = state.sim.forcedMove()
             if forced >= 0:
@@ -321,74 +413,77 @@ proc runEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             else:
               simCopy = state.sim
               seatPrompt = state.prompts[call.slot]
-              seatScripted = state.scripted[call.slot] or stopReason.len > 0
-              seatExternal = state.external[call.slot] and
-                state.playerSockets.hasKey(call.slot)
+              seatModel = state.seatModels[call.slot]
+              seatScripted = state.scripted[call.slot]
+              seatExternal = state.external[call.slot]
               baseline = state.baselines[call.slot]
               if seatExternal and not seatScripted:
-                inc state.decisionId
-                decisionId = state.decisionId
-                state.pendingAction = nil
-                var observation = state.playerStateJson(call.slot)
-                var legal = newJArray()
-                for index, move in state.sim.legalMoves():
-                  let description =
-                    case move.kind
-                    of mkPlay: "Play " & cardCode(move.card)
-                    of mkDiscard: "Discard " & cardCode(move.card)
-                    of mkPass: "Pass " & cardCode(move.cards[0])
-                    of mkBid:
-                      move.action & (if move.suit >= 0:
-                        " " & suitName(move.suit) else: "") &
-                        (if move.action == "bid": " " & $move.value else: "")
-                    of mkNone: "No action"
-                  legal.add(%*{"id": index + 1, "description": description})
-                observation["legalActions"] = legal
-                state.playerSockets[call.slot].send($ %*{
-                  "type": "observation", "id": decisionId,
-                  "observation": observation})
+                if not state.playerSockets.hasKey(call.slot):
+                  inconclusiveStop = ""
+                else:
+                  inc state.decisionId
+                  decisionId = state.decisionId
+                  state.pendingAction = nil
+                  var observation = state.playerStateJson(call.slot)
+                  var legal = newJArray()
+                  for index, move in state.sim.legalMoves():
+                    let description =
+                      case move.kind
+                      of mkPlay: "Play " & cardCode(move.card)
+                      of mkDiscard: "Discard " & cardCode(move.card)
+                      of mkPass: "Pass " & cardCode(move.cards[0])
+                      of mkBid:
+                        move.action & (if move.suit >= 0:
+                          " " & suitName(move.suit) else: "") &
+                          (if move.action == "bid": " " & $move.value else: "")
+                      of mkNone: "No action"
+                    legal.add(%*{"id": index + 1, "description": description})
+                  observation["legalActions"] = legal
+                  state.playerSockets[call.slot].send($ %*{
+                    "type": "observation", "id": decisionId,
+                    "observation": observation})
 
+      if inconclusiveStop.len > 0:
+        failEpisode(runtimeConfig, 0, "episode_inconclusive", inconclusiveStop)
+        return
       if settled:
         break
       if simCopy.names.len == 0:
-        ## The iteration dealt a hand or played a forced card; loop again.
         if paceTrick and config.turnDelayMs > 0:
           sleep(config.turnDelayMs)
         continue
 
-      ## With no credentials at all the decision is scripted by construction:
-      ## no request is issued, so no spacing is owed and nothing is a
-      ## fallback. That is what keeps offline certification and the docker
-      ## smoke finishing in a second rather than in ten minutes.
-      var modelPath = not seatScripted and
-        (seatExternal or not client.disabled)
+      var modelPath = not seatScripted
       if modelPath:
-        ## Decision-start to decision-start spacing floor.
         let spacing = (DecisionSpacingMs + client.extraSpacingMs).float / 1000.0
         let wait = lastDecisionAt + spacing - epochTime()
         if wait > 0:
           sleep(int(wait * 1000))
-        ## The guards above were read BEFORE that sleep, and a throttled
-        ## episode's spacing floor is measured in seconds. Read them again,
-        ## and refuse a call whose own worst case (one attempt, one retry)
-        ## would not return before the hard deadline: the episode has to
-        ## settle inside the budget, not just start settling inside it.
         let now = epochTime()
         if now > softDeadline or
             now + client.worstCaseCallSeconds() > hardDeadline:
           if stopReason.len == 0:
             stopReason = "deadline"
-          seatScripted = true
-          modelPath = false
-        else:
-          lastDecisionAt = now
-          inc modelCalls
+          withLock stateLock:
+            state.sim.voidHand()
+            state.broadcastLocked()
+          if state.sim.handsScored > 0:
+            break
+          failEpisode(runtimeConfig, 0, "episode_inconclusive",
+            "episode reached deadline before any hand was scored")
+          return
+        lastDecisionAt = now
+        inc modelCalls
 
-      ## The slow part (Claude) runs outside the lock on a snapshot; only
-      ## this thread mutates the sim, so the snapshot cannot go stale.
-      var decision = client.decide(simCopy, seatPrompt,
-        seatScripted or seatExternal, baseline, state.selection)
-      if seatExternal and modelPath:
+      var decision: Decision
+      if seatExternal and not seatScripted:
+        var connected = false
+        withLock stateLock:
+          connected = state.playerSockets.hasKey(call.slot)
+        if not connected:
+          failEpisode(runtimeConfig, call.slot, "player_error",
+            "external player slot " & $call.slot & " disconnected")
+          return
         let deadline = epochTime() + config.llmTimeoutSeconds.float
         var action: JsonNode
         while epochTime() < deadline:
@@ -397,13 +492,18 @@ proc runEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if not action.isNil:
             break
           sleep(20)
-        if not action.isNil and action.kind == JObject and
-            action.hasKey("choices") and action["choices"].kind == JArray:
+        if action.isNil:
+          failEpisode(runtimeConfig, call.slot, "player_error",
+            "external player slot " & $call.slot & " timed out waiting for action")
+          return
+        var valid = action.kind == JObject and
+          action.hasKey("choices") and action["choices"].kind == JArray
+        var selected: seq[int]
+        let legal = simCopy.legalMoves()
+        if valid:
           let choices = action["choices"]
-          let legal = simCopy.legalMoves()
           let needed = if simCopy.phase == phPass: 3 else: 1
-          var valid = choices.len == needed
-          var selected: seq[int]
+          valid = choices.len == needed
           if valid:
             for choice in choices:
               if choice.kind != JInt or choice.getInt() < 1 or
@@ -411,26 +511,40 @@ proc runEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 valid = false
                 break
               selected.add(choice.getInt())
-          if valid:
-            decision.move =
-              if simCopy.phase == phPass:
-                block:
-                  var cards: seq[int]
-                  for choice in selected:
-                    cards.add(legal[choice - 1].cards[0])
-                  passMove(cards)
-              else: legal[selected[0] - 1]
-            decision.submittedResponse = $action
-            decision.scripted = false
-            decision.forced = false
-            decision.error = ""
-            decision.notes = action{"notes"}.getStr()
+        if not valid:
+          failEpisode(runtimeConfig, call.slot, "player_error",
+            "external player slot " & $call.slot & " submitted invalid action",
+            $action)
+          return
+        decision.move =
+          if simCopy.phase == phPass:
+            block:
+              var cards: seq[int]
+              for choice in selected:
+                cards.add(legal[choice - 1].cards[0])
+              passMove(cards)
+          else: legal[selected[0] - 1]
+        decision.submittedResponse = $action
+        decision.scripted = false
+        decision.forced = false
+        decision.error = ""
+        decision.notes = cleanNotes(action{"notes"}.getStr())
+      else:
+        decision = client.decide(simCopy, seatPrompt, seatScripted,
+          baseline, state.selection, seatModel)
 
-      var appliedFallback = ""
+      if decision.failed:
+        withLock stateLock:
+          if state.trajectory.isSome:
+            state.trajectory.get().recordFailedDecision(simCopy, call.slot,
+              decision, seatPrompt, state.selection)
+        failEpisode(runtimeConfig, call.slot, decision.failureKind,
+          decision.error, decision.rawOutput)
+        return
+
+      var applyError = ""
       withLock stateLock:
         inc state.sim.decisions[call.slot]
-        if decision.scripted and modelPath:
-          inc state.sim.fallbacks[call.slot]
         if decision.forced:
           inc state.sim.forcedMoves[call.slot]
         echo "trick-taking: hand ", state.sim.hand + 1, " ",
@@ -440,20 +554,25 @@ proc runEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           state.sim.applyMove(decision.move, decision.notes,
             decision.scripted or seatScripted)
         except TricksError as error:
-          echo "trick-taking: move rejected; using the scripted fallback"
-          inc state.sim.fallbacks[call.slot]
-          appliedFallback = "engine-rejection"
-          let fallback = baselineDecision(state.sim, baseline, error.msg)
-          if fallback.forced:
-            inc state.sim.forcedMoves[call.slot]
-          state.sim.applyMove(fallback.move, "", true)
-        if state.trajectory.isSome:
-          if seatScripted and not state.scripted[call.slot]: appliedFallback = "deadline"
-          if seatExternal and decision.scripted: appliedFallback = "external-timeout"
-          state.trajectory.get().recordAppliedDecision(simCopy, state.sim,
-            call.slot, decision, seatPrompt, state.scripted[call.slot], state.selection, appliedFallback)
-        paceTrick = state.sim.trickComplete
-        state.broadcastLocked()
+          applyError = "move rejected: " & error.msg
+        if applyError.len == 0:
+          if state.trajectory.isSome:
+            state.trajectory.get().recordAppliedDecision(simCopy, state.sim,
+              call.slot, decision, seatPrompt, state.scripted[call.slot], state.selection, "")
+          paceTrick = state.sim.trickComplete
+          state.broadcastLocked()
+
+      if applyError.len > 0:
+        withLock stateLock:
+          if state.trajectory.isSome:
+            decision.failed = true
+            decision.failureKind = "player_error"
+            decision.error = applyError
+            state.trajectory.get().recordFailedDecision(simCopy, call.slot,
+              decision, seatPrompt, state.selection)
+        failEpisode(runtimeConfig, call.slot, "player_error", applyError,
+          decision.submittedResponse)
+        return
 
       ## Pace after each COMPLETED trick, not after each card.
       if paceTrick and config.turnDelayMs > 0:
@@ -464,32 +583,13 @@ proc runEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     finishEpisode(runtimeConfig)
 
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
-  ## The game thread's top-level guard.
-  ##
-  ## `runEpisode` has one `try` of its own, around the model move. Two other
-  ## sites can raise `TricksError` in principle -- the deal and the forced
-  ## fallback apply -- and neither is reachable: `beginHand` raises only on a
-  ## wrong phase or a short remainder, both ruled out by `validate`, and
-  ## `baselineDecision` probes its own move and falls back to `lowestLegal`,
-  ## which cannot be empty in a decision phase. That is an argument, not a
-  ## guarantee, and the failure it protects against is silent: a game thread
-  ## that dies writes no `results.json` and no replay, sends no `final`
-  ## frame, and leaves `/healthz` answering until the platform kills the pod.
-  ## An episode that cannot finish still has to settle and write what it has.
   {.gcsafe.}:
     try:
       runEpisode(runtimeConfig)
     except CatchableError as error:
-      echo "trick-taking: game thread failed (", error.name, ")"
-      withLock stateLock:
-        ## `deadline` is the honest reason: the episode stopped without
-        ## completing its hands. The hands already scored keep their scores;
-        ## `results.reason` stays inside the declared enum.
-        state.sim.endEarly("deadline")
-        state.broadcastLocked()
-      ## Idempotent (`state.finished`), so this is a no-op if the failure
-      ## happened inside finishEpisode itself.
-      finishEpisode(runtimeConfig)
+      echo "trick-taking: game thread failed (", error.name, "): ", error.msg
+      failEpisode(runtimeConfig, 0, "episode_inconclusive",
+        "game thread failed (" & $error.name & "): " & error.msg)
 
 var gameThread: Thread[RuntimeConfig]
 
@@ -612,6 +712,7 @@ proc websocketHandler(
             raise newException(TricksError, "unknown player control")
           withLock stateLock:
             state.external[slot] = true
+            state.registered[slot] = true
           return
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
@@ -627,14 +728,19 @@ proc websocketHandler(
           var baseline = payload{"baseline"}.getStr("follow").strip()
           if baseline notin Baselines:
             baseline = "follow"
+          let seatModel = if scripted: "" else: payload{"model"}.getStr().strip()
           withLock stateLock:
             state.prompts[slot] = prompt
+            state.seatModels[slot] = seatModel
             state.scripted[slot] = scripted
             state.external[slot] = false
             state.baselines[slot] = baseline
+            state.registered[slot] = true
           echo "trick-taking: slot ", slot, " delivered a prompt (",
             prompt.len, " chars",
-            (if scripted: ", scripted " & baseline else: ""), ")"
+            (if scripted: ", scripted " & baseline
+             elif seatModel.len > 0: ", model " & seatModel
+             else: ""), ")"
       except CatchableError as error:
         echo "trick-taking: ignoring bad player frame: ", error.msg
     of ErrorEvent:
@@ -696,8 +802,10 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig, selection:
       "trick-taking-" & $config.seed, "trick-taking",
       getEnv("COWORLD_GAME_VERSION"), getEnv("COWORLD_SOURCE_REVISION")))
   state.prompts = newSeq[string](config.players.len)
+  state.seatModels = newSeq[string](config.players.len)
   state.scripted = newSeq[bool](config.players.len)
   state.external = newSeq[bool](config.players.len)
+  state.registered = newSeq[bool](config.players.len)
   state.baselines = newSeq[string](config.players.len)
   for slot in 0 ..< config.players.len:
     state.baselines[slot] = "follow"
